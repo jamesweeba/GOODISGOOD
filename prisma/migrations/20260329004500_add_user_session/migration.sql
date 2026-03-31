@@ -1,0 +1,2 @@
+-- This migration is intentionally left blank.
+-- The UserSession table was already created in the previous migration.

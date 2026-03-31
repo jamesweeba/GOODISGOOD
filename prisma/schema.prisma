@@ -1,0 +1,84 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum OrderStatus {
+  pending
+  awaiting_payment
+  paid
+  cancelled
+  expired
+}
+
+model Product {
+  id          String      @id @default(uuid())
+  name        String      @unique
+  price       Decimal     @db.Decimal(10, 2)
+  description String?
+  active      Boolean     @default(true)
+  orderItems  OrderItem[]
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+}
+
+model Order {
+  id            String       @id @default(uuid())
+  userPhone     String
+  status        OrderStatus  @default(pending)
+  total         Decimal      @db.Decimal(10, 2)
+  items         OrderItem[]
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+  expiresAt     DateTime?
+  paymentUrl    String?
+  paymentRef    String?      @unique
+
+  @@index([userPhone, status])
+}
+
+model OrderItem {
+  id        String   @id @default(uuid())
+  order     Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  orderId   String
+  product   Product  @relation(fields: [productId], references: [id])
+  productId String
+  quantity  Int
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([orderId, productId])
+}
+
+model ChatHistory {
+  id        String   @id @default(uuid())
+  userPhone String
+  role      String
+  message   String
+  createdAt DateTime @default(now())
+
+  @@index([userPhone, createdAt])
+}
+
+model WebhookDeduplication {
+  id        String   @id @default(uuid())
+  messageId String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([expiresAt])
+}
+
+model UserSession {
+  id             String   @id @default(uuid())
+  userPhone      String   @unique
+  activeState    String?
+  statePayload   Json?
+  lastMessage    String?
+  updatedAt      DateTime @updatedAt
+  createdAt      DateTime @default(now())
+}
