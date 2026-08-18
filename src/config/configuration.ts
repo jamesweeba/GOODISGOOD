@@ -28,6 +28,7 @@ export function validateEnvironment(env: Environment) {
   requireString(env, "WHATSAPP_TOKEN");
   requireString(env, "WHATSAPP_PHONE_ID");
   requireString(env, "WHATSAPP_VERIFY_TOKEN");
+  requireString(env, "WHATSAPP_APP_SECRET");
 
   if (provider === "openai") {
     requireString(env, "OPENAI_API_KEY");
@@ -63,15 +64,25 @@ export function configuration() {
     app: {
       port: Number(process.env.PORT ?? 3100),
       baseUrl: process.env.APP_BASE_URL ?? "http://localhost:3100",
+      adminPhone: process.env.ADMIN_PHONE,
+      rateLimit: Number(process.env.RATE_LIMIT ?? 20),
+      welcomeImageUrl:
+        process.env.MARKETIX_WELCOME_IMAGE_URL ??
+        `${process.env.APP_BASE_URL ?? "http://localhost:3100"}/welcome-banner.png`,
     },
     whatsapp: {
       token: process.env.WHATSAPP_TOKEN,
+      appSecret: process.env.WHATSAPP_APP_SECRET,
       phoneId: process.env.WHATSAPP_PHONE_ID,
       verifyToken: process.env.WHATSAPP_VERIFY_TOKEN,
+      privateKey: process.env.WHATSAPP_PRIVATE_KEY,
       apiVersion: process.env.WHATSAPP_API_VERSION ?? "v21.0",
       typingIndicatorDelayMs: Number(
         process.env.WHATSAPP_TYPING_INDICATOR_DELAY_MS ?? 2500,
       ),
+      flowId: process.env.WHATSAPP_FLOW_ID,
+      flowMode: process.env.WHATSAPP_FLOW_MODE || 'draft',
+      catalogId: process.env.WHATSAPP_CATALOG_ID,
     },
     ai: {
       provider: process.env.AI_PROVIDER ?? "openai",
@@ -80,6 +91,8 @@ export function configuration() {
       anthropicApiKey: process.env.ANTHROPIC_API_KEY,
       anthropicModel:
         process.env.ANTHROPIC_MODEL ?? "claude-3-5-sonnet-20241022",
+      openRouterApiKey: process.env.OPEN_ROUTER_KEY,
+      openRouterModel: process.env.OPEN_ROUTER_MODEL,
     },
     payments: {
       provider: process.env.PAYMENT_PROVIDER ?? "mock",
@@ -172,6 +185,9 @@ export function configuration() {
     },
     cart: {
       expiryHours: Number(process.env.CART_EXPIRY_HOURS ?? 24),
+    },
+    admin: {
+      token: process.env.ADMIN_TOKEN || undefined,
     },
   };
 }

@@ -73,10 +73,21 @@ export class OrdersService {
       return null;
     }
 
+    // Apply loyalty discount if applicable
+    const profile = await this.prisma.userProfile.findUnique({ where: { phone: userPhone } });
+    let discount = new Prisma.Decimal(0);
+    if (profile && profile.purchaseCount >= 3) {
+        discount = order.total.mul(0.1); // 10% discount for repeat customers
+    }
+
+    const finalTotal = order.total.minus(discount);
+
     const paymentRef = order.paymentRef ?? `order-${order.id}`;
     const paymentUrl = await this.paymentsService.createPaymentLink({
-      ...order,
+      id: order.id,
       paymentRef,
+      total: Number(finalTotal),
+      userPhone,
     });
 
     return this.prisma.order.update({
@@ -85,6 +96,8 @@ export class OrdersService {
         status: OrderStatus.awaiting_payment,
         paymentRef,
         paymentUrl,
+        discount,
+        total: finalTotal,
       },
       include: {
         items: {
@@ -94,11 +107,6 @@ export class OrdersService {
         },
       },
     });
-  }
-
-  async createPaymentLinkForPending(userPhone: string) {
-    const order = await this.requestPayment(userPhone);
-    return order?.paymentUrl ?? null;
   }
 
   async getPaymentMessage(userPhone: string) {
@@ -107,60 +115,138 @@ export class OrdersService {
       return null;
     }
 
+    const discountText = order.discount && Number(order.discount) > 0 
+        ? `\nLoyalty Discount: -$${Number(order.discount).toFixed(2)}` 
+        : '';
+
+    if (order.paymentUrl === 'PROMPT_SENT') {
+        return [
+          'Items in your cart:',
+          ...order.items.map((item) => {
+            const lineTotal = Number(item.product.price) * item.quantity;
+            return `${item.product.name} x ${item.quantity} = GHS ${lineTotal.toFixed(2)}`;
+          }),
+          `Subtotal: GHS ${(Number(order.total) + Number(order.discount || 0)).toFixed(2)}`,
+          discountText,
+          `*Total: GHS ${Number(order.total).toFixed(2)}*`,
+          '',
+          '🚀 *A payment prompt has been sent to your phone!*',
+          'Please enter your PIN to complete the purchase.',
+        ].join('\n');
+    }
+
     return [
       'Items in your cart:',
       ...order.items.map((item) => {
         const lineTotal = Number(item.product.price) * item.quantity;
-        return `${item.product.name} x ${item.quantity} = $${lineTotal.toFixed(2)}`;
+        return `${item.product.name} x ${item.quantity} = GHS ${lineTotal.toFixed(2)}`;
       }),
-      `Total: $${Number(order.total).toFixed(2)}`,
+      `Subtotal: GHS ${(Number(order.total) + Number(order.discount || 0)).toFixed(2)}`,
+      discountText,
+      `*Total: GHS ${Number(order.total).toFixed(2)}*`,
       '',
       'Complete your payment here:',
       order.paymentUrl,
     ].join('\n');
   }
 
-  async cancelPending(userPhone: string) {
+  async saveCustomerInfo(userPhone: string, name: string) {
+    await this.prisma.userProfile.upsert({
+        where: { phone: userPhone },
+        create: { phone: userPhone, name },
+        update: { name },
+    });
+
     const order = await this.getPending(userPhone);
-    if (!order) {
-      return null;
-    }
+    if (!order) return null;
 
     return this.prisma.order.update({
       where: { id: order.id },
-      data: {
-        status: OrderStatus.cancelled,
-      },
-      include: {
-        items: {
-          include: {
-            product: true,
-          },
-        },
+      data: { customerName: name },
+    });
+  }
+
+  async saveShippingAddress(userPhone: string, address: string) {
+    await this.prisma.userProfile.update({
+        where: { phone: userPhone },
+        data: { defaultAddress: address },
+    });
+
+    const order = await this.getPending(userPhone);
+    if (!order) return null;
+
+    return this.prisma.order.update({
+      where: { id: order.id },
+      data: { shippingAddress: address },
+    });
+  }
+
+  async saveCustomerFlowData(userPhone: string, data: { full_name: string; shipping_address: string }) {
+    await this.prisma.userProfile.upsert({
+      where: { phone: userPhone },
+      create: { phone: userPhone, name: data.full_name, defaultAddress: data.shipping_address },
+      update: { name: data.full_name, defaultAddress: data.shipping_address },
+    });
+
+    const order = await this.getPending(userPhone);
+    if (!order) return null;
+
+    return this.prisma.order.update({
+      where: { id: order.id },
+      data: { 
+        customerName: data.full_name, 
+        shippingAddress: data.shipping_address 
       },
     });
   }
 
-  async clearCart(userPhone: string) {
-    const order = await this.getPending(userPhone);
-    if (!order || order.items.length === 0) {
-      return 'Your cart is already empty.';
+  async getTrackingInfo(userPhone: string) {
+    const lastPaidOrder = await this.prisma.order.findFirst({
+        where: { userPhone, status: OrderStatus.paid },
+        orderBy: { updatedAt: 'desc' },
+    });
+
+    if (!lastPaidOrder) return "You don't have any recent paid orders.";
+    
+    if (lastPaidOrder.trackingNumber) {
+        return `Your last order (${lastPaidOrder.id.slice(0,8)}) is on its way! Tracking: ${lastPaidOrder.trackingNumber}`;
     }
 
-    await this.prisma.$transaction([
-      this.prisma.orderItem.deleteMany({
-        where: { orderId: order.id },
-      }),
-      this.prisma.order.update({
-        where: { id: order.id },
-        data: {
-          total: new Prisma.Decimal(0),
-          status: OrderStatus.cancelled,
-        },
-      }),
-    ]);
+    return `Your last order (${lastPaidOrder.id.slice(0,8)}) is currently being processed.`;
+  }
 
-    return 'Your cart has been cleared.';
+  async reorderLastOrder(userPhone: string) {
+    const lastOrder = await this.prisma.order.findFirst({
+        where: { userPhone, status: OrderStatus.paid },
+        include: { items: { include: { product: true } } },
+        orderBy: { createdAt: 'desc' },
+    });
+
+    if (!lastOrder || lastOrder.items.length === 0) {
+        return "I couldn't find any previous orders to repeat.";
+    }
+
+    const itemsToReorder = lastOrder.items.map(item => ({
+        name: item.product.name,
+        quantity: item.quantity
+    }));
+
+    await this.createOrderMulti(userPhone, itemsToReorder);
+    return `I've added the items from your last order to your cart:\n\n${await this.viewCart(userPhone)}`;
+  }
+
+  async markAsPaid(orderId: string) {
+    const order = await this.prisma.order.update({
+        where: { id: orderId },
+        data: { status: OrderStatus.paid },
+    });
+
+    await this.prisma.userProfile.update({
+        where: { phone: order.userPhone },
+        data: { purchaseCount: { increment: 1 } },
+    });
+
+    return order;
   }
 
   async viewCart(userPhone: string) {
@@ -172,10 +258,10 @@ export class OrdersService {
     const lines = order.items.map((item) => {
       const lineTotal =
         Number(item.product.price) * item.quantity;
-      return `${item.product.name} x ${item.quantity} = $${lineTotal.toFixed(2)}`;
+      return `${item.product.name} x ${item.quantity} = GHS ${lineTotal.toFixed(2)}`;
     });
 
-    return ['Items in your cart:', ...lines, `Total: $${Number(order.total).toFixed(2)}`].join(
+    return ['Items in your cart:', ...lines, `Total: GHS ${Number(order.total).toFixed(2)}`].join(
       '\n',
     );
   }
@@ -287,6 +373,28 @@ export class OrdersService {
       `Removed ${removedItems.join(', ')} from your cart.`,
       await this.viewCart(userPhone),
     ].join('\n');
+  }
+
+  async clearCart(userPhone: string) {
+    const order = await this.getPending(userPhone);
+    if (!order || order.items.length === 0) {
+      return 'Your cart is already empty.';
+    }
+
+    await this.prisma.$transaction([
+      this.prisma.orderItem.deleteMany({
+        where: { orderId: order.id },
+      }),
+      this.prisma.order.update({
+        where: { id: order.id },
+        data: {
+          total: new Prisma.Decimal(0),
+          status: OrderStatus.cancelled,
+        },
+      }),
+    ]);
+
+    return 'Your cart has been cleared.';
   }
 
   async expireOldCarts(hours = this.configService.get<number>('cart.expiryHours', 24)) {

@@ -7,8 +7,9 @@ import { PrismaService } from '../database/prisma.service';
 import { OrdersService } from '../orders/orders.service';
 import { ProductsService } from '../products/products.service';
 import { WhatsAppService } from '../whatsapp/whatsapp.service';
+import { RetentionService } from './retention.service';
 
-type AssistantReplyState = 'confirm_order' | 'request_payment';
+type AssistantReplyState = 'confirm_order' | 'request_payment' | 'collect_name' | 'collect_address' | 'await_flow' | 'select_quantity';
 
 type AssistantReply = {
   text: string;
@@ -16,68 +17,11 @@ type AssistantReply = {
     type: AssistantReplyState;
     payload?: Record<string, unknown>;
   };
+  interactive?: {
+    type: 'button' | 'list' | 'flow';
+    data: any;
+  };
 };
-
-type SessionState = {
-  type: AssistantReplyState;
-  payload: Record<string, unknown>;
-} | null;
-
-const DEFAULT_CHAT_PHRASES = {
-  greeting: [
-    'hi',
-    'hello',
-    'hey',
-    'yo',
-    'good morning',
-    'good afternoon',
-    'good evening',
-    'hola',
-  ],
-  affirmative: [
-    'yes',
-    'yep',
-    'yeah',
-    'yup',
-    'ok',
-    'okay',
-    'sure',
-    'alright',
-    'affirmative',
-    'go ahead',
-    'sounds good',
-  ],
-  negative: ['no', 'nope', 'nah', 'negative', 'not now'],
-  maybe: ['maybe', 'perhaps', 'not sure', 'unsure'],
-  productList: [
-    'products',
-    'list products',
-    'menu',
-    'show me what you have',
-    'in stock',
-    'available',
-    'have in stock',
-    'what do you have',
-    'what do you sell',
-    'show products',
-    'show me products',
-  ],
-  payment: [
-    'pay',
-    'payment',
-    'make payment',
-    'pay now',
-    'checkout',
-    'check out',
-    'send payment',
-    'complete payment',
-    'finish payment',
-  ],
-  cartView: ['cart', 'view cart'],
-  cartClear: ['clear cart', 'clear my cart', 'empty cart', 'remove all'],
-  purchase: ['want', 'buy', 'get', 'take', 'need', 'order', 'add', 'both'],
-  removal: ['remove', 'delete', 'take out', 'take off', 'drop', 'minus', 'subtract'],
-} as const;
 
 @Injectable()
 export class ChatService {
@@ -90,963 +34,836 @@ export class ChatService {
     private readonly whatsappService: WhatsAppService,
     private readonly ordersService: OrdersService,
     private readonly configService: ConfigService,
-  ) {}
+    private readonly retentionService: RetentionService,
+  ) { }
 
   async handleMessage(userPhone: string, message: string) {
     const trimmedMessage = message?.trim();
-    if (!trimmedMessage) {
-      return;
-    }
+    if (!trimmedMessage) return;
 
     try {
-      void this.ordersService.maybeExpireOldCarts().catch((error) => {
-        this.logger.warn(`Cart expiration sweep failed: ${String(error)}`);
-      });
+      this.logger.log(`Inbound message from ${userPhone}: "${trimmedMessage}"`);
 
-      const directReply = await this.tryDirectCommand(userPhone, trimmedMessage);
-      if (directReply) {
-        await this.updateUserSession(userPhone, directReply.state ?? null);
-
-        await Promise.all([
-          this.prisma.chatHistory.create({
-            data: {
-              userPhone,
-              message: trimmedMessage,
-              role: 'user',
-            },
-          }),
-          this.prisma.chatHistory.create({
-            data: {
-              userPhone,
-              message: directReply.text,
-              role: 'assistant',
-            },
-          }),
-          this.whatsappService.sendMessage(userPhone, directReply.text),
-        ]);
+      // 1. Rate Limiting
+      if (await this.isRateLimited(userPhone)) {
+        this.logger.warn(`Rate limit triggered for ${userPhone}`);
+        await this.whatsappService.sendMessage(userPhone, "You've sent too many messages. Please try again in a few minutes.");
         return;
       }
 
-      await this.prisma.chatHistory.create({
-        data: {
-          userPhone,
-          message: trimmedMessage,
-          role: 'user',
-        },
+      // 2. State-based handling (Interactive button replies etc)
+      const session = await this.prisma.userSession.findUnique({ where: { userPhone } });
+      const currentState = session?.activeState as AssistantReplyState | null;
+      this.logger.log(`Current session state for ${userPhone}: ${currentState ?? 'idle'}`);
+
+      // Handle Direct/State transitions
+      const directReply = await this.tryDirectOrStateCommand(userPhone, trimmedMessage, currentState);
+      if (directReply) {
+        this.logger.log(`Direct route matched for ${userPhone}: ${directReply.state?.type ?? 'message_only'}`);
+        await this.sendReply(userPhone, trimmedMessage, directReply);
+        return;
+      }
+
+      // Trigger background retention checks (Abandoned cart, New arrivals)
+      this.retentionService.runRetentionChecks().catch(e => this.logger.error('Retention check failed', e));
+
+      // 3. Smart Catalog Retrieval & AI Fallback
+      const history = await this.prisma.chatHistory.findMany({
+        where: { userPhone },
+        orderBy: { createdAt: 'desc' },
+        take: 10,
       });
 
-      const [products, history] = await Promise.all([
-        this.productsService.listAvailableProducts(),
-        this.prisma.chatHistory.findMany({
-          where: { userPhone },
-          orderBy: { createdAt: 'desc' },
-          take: 6,
-        }),
-      ]);
+      // 1. Get Intent First (to decide if we search DB)
+      const { intent, searchKeywords } = await this.aiService.classifyIntent(message);
+      this.logger.log(`User Intent: ${intent} | Keywords: ${searchKeywords}`);
 
-      const rawResponse = await this.aiService.generateReply({
-        message: trimmedMessage,
+      let products: any[] = [];
+
+      // 2. Conditional Database Search
+      if (intent === 'browse' || intent === 'order' || (searchKeywords && searchKeywords.length > 0)) {
+        products = await this.productsService.searchProducts(searchKeywords || message);
+      }
+
+      // 3. Generate Grounded Response
+      const rawAiReply = await this.aiService.generateGroundedReply({
+        message,
+        intent,
         products,
-        history: history.reverse(),
+        history: history.reverse()
       });
-      const aiResponse = this.aiService.parseReply(rawResponse);
-      const reply = await this.handleAction(aiResponse, userPhone);
 
-      await this.updateUserSession(userPhone, reply.state ?? null);
+      this.logger.log(`AI raw response received for ${userPhone}`);
+      const aiResponse = this.aiService.parseReply(rawAiReply);
+      this.logger.log(`AI parsed response for ${userPhone}: intent=${aiResponse.intent}, action=${aiResponse.action}`);
+      const reply = await this.handleAiAction(aiResponse, userPhone, currentState);
+      this.logger.log(`Final reply state for ${userPhone}: ${reply.state?.type ?? 'none'}`);
 
-      await Promise.all([
-        this.prisma.chatHistory.create({
-          data: {
-            userPhone,
-            message: reply.text,
-            role: 'assistant',
-          },
-        }),
-        this.whatsappService.sendMessage(userPhone, reply.text),
-      ]);
-    } catch (error) {
-      const messageText =
-        error instanceof Error ? error.message : 'Unexpected error';
+      await this.sendReply(userPhone, message, reply);
 
-      this.logger.error('Failed to handle incoming message', error);
-      await this.whatsappService.sendMessage(
-        userPhone,
-        `Sorry, something went wrong: ${messageText}`,
-      );
+    } catch (error: any) {
+      this.logger.error(`Error handling message from ${userPhone}:`, error?.response?.data || error.message || error);
+      await this.whatsappService.sendMessage(userPhone, "Sorry, I encountered an error. Please try again later.");
     }
   }
 
-  private async handleAction(ai: AiReply, userPhone: string): Promise<AssistantReply> {
-    if (ai.action === 'confirm_order' && ai.products.length > 0) {
-      return {
-        text: `You selected ${ai.products
-          .map((product) => `${product.name} x ${product.quantity}`)
-          .join(', ')}. Reply YES to create the order or NO to cancel.`,
-        state: {
-          type: 'confirm_order',
-          payload: {
-            products: ai.products,
-          },
-        },
-      };
+  private async isRateLimited(userPhone: string): Promise<boolean> {
+    const limit = this.configService.get<number>('app.rateLimit', 20); // 20 msgs per hour
+    const windowMs = 60 * 60 * 1000;
+    const now = new Date();
+
+    const rate = await this.prisma.rateLimit.upsert({
+      where: { userPhone },
+      create: { userPhone, count: 1, lastReset: now },
+      update: {},
+    });
+
+    if (now.getTime() - rate.lastReset.getTime() > windowMs) {
+      await this.prisma.rateLimit.update({
+        where: { userPhone },
+        data: { count: 1, lastReset: now },
+      });
+      return false;
     }
 
-    if (ai.action === 'create_order' && ai.products.length > 0) {
-      const order = await this.ordersService.createOrderMulti(userPhone, ai.products);
-      return {
-        text: `Order created. Total: $${Number(order.total).toFixed(
-          2,
-        )}. Reply YES when you are ready to pay.`,
-        state: {
-          type: 'request_payment',
-        },
-      };
-    }
+    if (rate.count >= limit) return true;
 
-    if (ai.action === 'request_payment') {
-      const paymentMessage = await this.ordersService.getPaymentMessage(userPhone);
-      if (!paymentMessage) {
+    await this.prisma.rateLimit.update({
+      where: { userPhone },
+      data: { count: { increment: 1 } },
+    });
+    return false;
+  }
+
+  private async tryDirectOrStateCommand(userPhone: string, message: string, state: AssistantReplyState | null): Promise<AssistantReply | null> {
+    const normalized = message.toLowerCase();
+
+    // Handle interactive button replies from WhatsApp (they often come as the button title or ID)
+    if (state === 'confirm_order') {
+      if (normalized === 'yes' || normalized === 'confirm_yes') {
         return {
-          text: 'There is no active order to pay for yet. Add items to your cart first.',
+          text: "Great! What is your full name?",
+          state: { type: 'collect_name' }
         };
+      }
+      if (normalized === 'no' || normalized === 'confirm_no') {
+        await this.ordersService.clearCart(userPhone);
+        return { text: "Order cancelled. Your cart is now empty." };
+      }
+    }
+
+    if (state === 'collect_name') {
+      await this.ordersService.saveCustomerInfo(userPhone, message);
+      return {
+        text: `Thanks, ${message}! What is your shipping address?`,
+        state: { type: 'collect_address' }
+      };
+    }
+
+    if (state === 'collect_address') {
+      await this.ordersService.saveShippingAddress(userPhone, message);
+      const paymentMsg = await this.ordersService.getPaymentMessage(userPhone);
+      this.notifyAdmin(userPhone, "New order ready for payment");
+      return {
+        text: `Perfect! We have everything we need.\n\n${paymentMsg}`,
+        state: { type: 'request_payment' }
+      };
+    }
+
+    // Basic direct commands
+    if (normalized === 'cart' || normalized === 'view cart' || normalized === 'view_cart') {
+      const cartSummary = await this.ordersService.viewCart(userPhone);
+      if (cartSummary.includes('empty')) {
+        return {
+          text: cartSummary,
+          interactive: {
+            type: 'button',
+            data: {
+              body: cartSummary,
+              buttons: [{ id: 'catalog', title: '🛒 Browse Catalog' }]
+            }
+          }
+        };
+      }
+      return {
+        text: cartSummary,
+        interactive: {
+          type: 'button',
+          data: {
+            body: `🛍️ *Your Current Cart*\n\n${cartSummary}\n\nWhat would you like to do?`,
+            buttons: [
+              { id: 'checkout', title: '💳 Checkout' },
+              { id: 'catalog', title: '➕ Add More' },
+              { id: 'clear_cart', title: '🗑️ Clear Cart' }
+            ]
+          }
+        }
+      };
+    }
+
+    if (normalized === 'clear_cart') {
+      const reply = await this.ordersService.clearCart(userPhone);
+      return {
+        text: reply,
+        interactive: {
+          type: 'button',
+          data: {
+            body: "🗑️ Cart cleared successfully.",
+            buttons: [{ id: 'catalog', title: '🛒 Start Over' }]
+          }
+        }
+      };
+    }
+
+    if (normalized === 'hi' || normalized === 'hello') {
+      const reorderOffer = await this.retentionService.offerReorderIfFrequent(userPhone);
+      const body = reorderOffer
+        ? `Welcome back! ${reorderOffer}\n\nHow can I help you today?`
+        : "Hello! I'm your AI sales agent. Tap a button below to get started or just tell me what you're looking for.";
+
+      const hasPastOrder = await this.prisma.order.findFirst({ where: { userPhone, status: 'paid' } });
+      const buttons = [
+        { id: 'catalog', title: '🛒 Catalog' },
+        { id: 'view_cart', title: '🛍️ My Cart' }
+      ];
+
+      if (hasPastOrder) {
+        buttons.push({ id: 'reorder', title: '🔄 Reorder Last Time' });
+      } else {
+        buttons.push({ id: 'order_status', title: '📦 Status' });
+      }
+
+      // 🖼️ Send the welcome banner image first (non-blocking)
+      const welcomeImageUrl = this.configService.get<string>('app.welcomeImageUrl');
+      if (welcomeImageUrl) {
+        this.whatsappService.sendImage(
+          userPhone,
+          welcomeImageUrl,
+          '🛍️ Marketix Groceries — Your Fresh Groceries, Delivered Fast!',
+        ).catch(() => this.logger.warn('Could not send welcome banner image'));
       }
 
       return {
-        text: paymentMessage,
-        state: {
-          type: 'request_payment',
-        },
+        text: body,
+        interactive: {
+          type: 'button',
+          data: {
+            body,
+            buttons
+          }
+        }
+      };
+    }
+
+    if (normalized === 'reorder') {
+      const reply = await this.ordersService.reorderLastOrder(userPhone);
+      return {
+        text: reply,
+        interactive: {
+          type: 'button',
+          data: {
+            body: reply,
+            buttons: [
+              { id: 'checkout', title: '💳 Checkout' },
+              { id: 'catalog', title: '🛒 Browse Catalog' }
+            ]
+          }
+        }
+      };
+    }
+
+    if (normalized === 'old_catalog' || normalized.startsWith('list_products')) {
+      const products = await this.productsService.listAvailableProducts();
+
+      if (products.length === 0) {
+        return { text: "Our catalog is currently empty. Please check back later!" };
+      }
+
+      const catalogId = this.configService.get<string>('whatsapp.catalogId');
+      if (catalogId && normalized === 'old_catalog') {
+        // Group by category
+        const categories = [...new Set(products.map(p => p.category || 'General'))];
+        const sections = categories.slice(0, 10).map(cat => ({
+          title: cat,
+          product_retailer_ids: products
+            .filter(p => (p.category || 'General') === cat)
+            .slice(0, 30)
+            .map(p => p.id)
+        }));
+
+        return {
+          text: "🛒 Browse our digital shop! Tap below to see our products grouped by category.",
+          interactive: {
+            type: 'button',
+            data: {
+              body: "Welcome to our digital shop! Browse our fresh arrivals and add items directly to your cart.",
+              buttons: [{ id: 'list_products', title: '📜 View Text List' }]
+            }
+          }
+        };
+      }
+
+      // Handle Pagination
+      const page = normalized.includes(':') ? parseInt(normalized.split(':')[1], 10) : 0;
+      const pageSize = 7;
+      const start = page * pageSize;
+      const end = start + pageSize;
+      const paginated = products.slice(start, end);
+      const hasNext = products.length > end;
+
+      const bodyText = `We have *${products.length} items* available today! \n\n_Showing page ${page + 1} of ${Math.ceil(products.length / pageSize)}._ \n\n_Tip: Select an item to add it to your cart. The catalog will stay open so you can add more!_`;
+
+      const rows = paginated.map(p => ({
+        id: `add_${p.id}`,
+        title: p.name.slice(0, 24),
+        description: `GHS ${Number(p.price).toFixed(2)}`
+      }));
+
+      const navigationRows = [];
+      if (hasNext) {
+        navigationRows.push({ id: `list_products:${page + 1}`, title: '➡️ Next Page', description: 'See more products' });
+      }
+      if (page > 0) {
+        navigationRows.push({ id: `list_products:${page - 1}`, title: '⬅️ Previous Page', description: 'Go back' });
+      }
+
+      navigationRows.push({ id: 'view_cart', title: '🛍️ View Cart', description: 'See what you added' });
+      navigationRows.push({ id: 'checkout', title: '💳 Checkout', description: 'Finish order' });
+
+      return {
+        text: bodyText,
+        interactive: {
+          type: 'list',
+          data: {
+            button: 'View Products',
+            sections: [
+              {
+                title: 'Available Products',
+                rows: rows
+              },
+              {
+                title: 'Navigation & Cart',
+                rows: navigationRows.slice(0, 10 - rows.length)
+              }
+            ]
+          }
+        }
+      };
+    }
+
+    if (normalized === 'flow_buy' || normalized === 'shop' || normalized === 'catalog' || normalized === 'list' || normalized === 'products') {
+      const flowId = this.configService.get<string>('whatsapp.flowId');
+      const dbProducts = (await this.productsService.listAvailableProducts()).slice(0, 10);
+
+      // Only use Flow if a flowId is configured
+      const flowMode = this.configService.get<string>('whatsapp.flowMode') ?? 'draft';
+      const useFlow = !!flowId;
+      if (useFlow) {
+        const allProducts = await this.productsService.listAvailableProducts();
+        const PAGE_SIZE = 5;
+        const totalPages = Math.max(1, Math.ceil(allProducts.length / PAGE_SIZE));
+        const pageProducts = allProducts.slice(0, PAGE_SIZE);
+
+        const pageOptions = Array.from({ length: totalPages }, (_, i) => ({
+          id: String(i + 1),
+          title: `Page ${i + 1}`,
+        }));
+
+        const flowData = {
+          banner_url: this.configService.get<string>('app.welcomeImageUrl') ?? '',
+          products: pageProducts.map((p) => {
+            const rawName = p.name as string;
+            const match = rawName.match(/^(.*?)\s*\(([^)]+)\)$/);
+            let parsedTitle = rawName;
+            let unit = '';
+            if (match) {
+              parsedTitle = match[1].trim();
+              unit = match[2].trim();
+            } else if (p.category && p.category !== 'General') {
+              unit = p.category;
+            }
+
+            const title = parsedTitle.length > 30
+              ? parsedTitle.substring(0, 27) + '…'
+              : parsedTitle;
+            const price = `₵${Number(p.price).toFixed(2)}`;
+            const description = unit ? `${price} · ${unit}` : price;
+            return { id: p.id, title, description };
+          }),
+          pre_selected: [] as string[],
+          page_label: `Page 1 of ${totalPages} · ${allProducts.length} products`,
+          selection_note: '0 items selected so far',
+          search_prefill: '',
+          page_options: pageOptions,
+          page_prefill: '1',
+          notice: '',
+          show_notice: false
+        };
+
+        return {
+          text: "Browse our products below and choose your quantities 🛒",
+          interactive: {
+            type: 'flow',
+            data: {
+              flowId,
+              buttonText: '🛒 Order Now',
+              flowToken: `buy-${Date.now()}`,
+              screenId: 'PRODUCT_SELECT',
+              data: flowData,
+            }
+          }
+        };
+      }
+
+      // Fallback: interactive list (works without a published flow)
+      if (dbProducts.length === 0) {
+        return { text: "Our catalog is currently empty. Please check back later!" };
+      }
+
+      const pageSize = 9;
+      const rows = dbProducts.slice(0, pageSize).map(p => ({
+        id: `add_${p.id}`,
+        title: p.name.slice(0, 24),
+        description: `₵${Number(p.price).toFixed(2)}`
+      }));
+
+      rows.push({ id: 'view_cart', title: '🛍️ View Cart', description: 'See your current cart' });
+
+      const bodyText = `We have *${dbProducts.length}+ items* available!\n\nTap a product to add it to your cart 👇`;
+      return {
+        text: bodyText,
+        interactive: {
+          type: 'list',
+          data: {
+            button: '🛒 Browse Products',
+            sections: [
+              { title: '🥬 Available Products', rows }
+            ]
+          }
+        }
+      };
+    }
+
+
+    if (normalized === 'full_catalog') {
+      const products = await this.productsService.listAvailableProducts();
+      const listText = products.map(p => `• *${p.name}*: GHS ${Number(p.price).toFixed(2)}`).join('\n');
+      return {
+        text: `📜 *Complete Price List*\n\n${listText}\n\n_To order, just type the name of the item!_`,
+        interactive: {
+          type: 'button',
+          data: {
+            body: `I've sent the full list of ${products.length} items above. Ready to order?`,
+            buttons: [{ id: 'catalog', title: '🛒 Open Selector' }]
+          }
+        }
+      };
+    }
+
+    if (normalized.startsWith('add_')) {
+      const productId = normalized.replace('add_', '');
+      const products = await this.productsService.listAvailableProducts();
+      const product = products.find(p => p.id === productId);
+
+      if (product) {
+        const bodyText = `🛒 *${product.name}*\nPrice: GHS ${Number(product.price).toFixed(2)}\n\nHow many would you like to add to your cart?`;
+
+        return {
+          text: bodyText,
+          state: { type: 'select_quantity', payload: { productId: product.id, productName: product.name } },
+          interactive: {
+            type: 'button',
+            data: {
+              body: bodyText,
+              buttons: [
+                { id: `qty_${product.id}_1`, title: '1' },
+                { id: `qty_${product.id}_3`, title: '3' },
+                { id: `qty_${product.id}_5`, title: '5' }
+              ]
+            }
+          }
+        };
+      }
+    }
+
+    if (state === 'select_quantity' && normalized.startsWith('qty_')) {
+      const parts = normalized.split('_');
+      const productId = parts[1];
+      const quantity = parseInt(parts[2], 10);
+
+      const products = await this.productsService.listAvailableProducts();
+      const product = products.find(p => p.id === productId);
+
+      if (product && !isNaN(quantity)) {
+        await this.ordersService.addItemsToCart(userPhone, [{ name: product.name, quantity }]);
+        const cart = await this.ordersService.viewCart(userPhone);
+        const totalItems = (cart.match(/•/g) || []).length;
+
+        const bodyText = `✅ Added *${quantity}x ${product.name}* to your cart!\n\nYou now have *${totalItems} items*. What would you like to do next?`;
+
+        return {
+          text: bodyText,
+          interactive: {
+            type: 'button',
+            data: {
+              body: bodyText,
+              buttons: [
+                { id: 'list_products', title: '🛒 Keep Shopping' },
+                { id: 'view_cart', title: '🛍️ View Cart' },
+                { id: 'checkout', title: '💳 Checkout' }
+              ]
+            }
+          }
+        };
+      }
+    }
+
+    if (normalized === 'checkout') {
+      const order = await this.ordersService.getPending(userPhone);
+      if (!order || order.items.length === 0) return { text: "Your cart is empty! Browse our products to add items." };
+      return this.handleAiAction({ action: 'collect_customer_info', reply: '', intent: 'order', products: [] }, userPhone, state);
+    }
+
+    if (normalized === 'order_status') {
+      return { text: await this.ordersService.getTrackingInfo(userPhone) };
+    }
+
+    if (normalized.includes('reorder') || normalized.includes('repeat last')) {
+      const reply = await this.ordersService.reorderLastOrder(userPhone);
+      return {
+        text: reply,
+        interactive: {
+          type: 'button',
+          data: {
+            body: reply,
+            buttons: [
+              { id: 'checkout', title: '💳 Checkout Now' },
+              { id: 'view_cart', title: '🛒 View Cart' }
+            ]
+          }
+        }
+      };
+    }
+
+    return null;
+  }
+
+  private async handleAiAction(ai: AiReply, userPhone: string, currentState: AssistantReplyState | null): Promise<AssistantReply> {
+    if (ai.action === 'confirm_order' && ai.products.length > 0) {
+      const summary = ai.products.map(p => `${p.name} x ${p.quantity}`).join(', ');
+      return {
+        text: `You want to add: ${summary}. Is this correct?`,
+        state: { type: 'confirm_order', payload: { products: ai.products } },
+        interactive: {
+          type: 'button',
+          data: {
+            body: `Confirm adding ${summary} to your cart?`,
+            buttons: [
+              { id: 'confirm_yes', title: 'Yes, confirm' },
+              { id: 'confirm_no', title: 'No, cancel' }
+            ]
+          }
+        }
+      };
+    }
+
+    if (ai.action === 'collect_customer_info') {
+      /* Disabling Flow for checkout until verification is approved
+      const flowId = this.configService.get<string>('whatsapp.flowId');
+      if (flowId) {
+        return {
+          text: "I'll need some details to complete your order. Please fill out this short form.",
+          state: { type: 'await_flow' },
+          interactive: {
+            type: 'flow',
+            data: {
+                flowId,
+                buttonText: 'Enter Details',
+                flowToken: `order-${Date.now()}`
+            }
+          }
+        };
+      }
+      */
+
+      return {
+        text: "I'll need some details to complete your order. What is your full name?",
+        state: { type: 'collect_name' }
       };
     }
 
     if (ai.intent === 'view_cart') {
-      return {
-        text: await this.ordersService.viewCart(userPhone),
-      };
+      return { text: await this.ordersService.viewCart(userPhone) };
     }
 
-    if (ai.intent === 'update_cart' && ai.products.length > 0) {
-      return {
-        text: await this.ordersService.updateCart(userPhone, ai.products),
-      };
+    if (ai.intent === 'provide_name' && currentState === 'collect_name') {
+      await this.ordersService.saveCustomerInfo(userPhone, ai.reply); // Assuming AI extracts name
+      return { text: "Got it! Now, what is your shipping address?", state: { type: 'collect_address' } };
     }
 
-    if (ai.intent === 'remove_from_cart' && ai.products.length > 0) {
-      return {
-        text: await this.ordersService.removeItemsFromCart(userPhone, ai.products),
-      };
+    if (ai.intent === 'reorder') {
+      return { text: await this.ordersService.reorderLastOrder(userPhone) };
     }
 
-    return {
-      text: ai.reply || 'I did not understand that. Please rephrase it.',
-    };
+    return { text: ai.reply };
   }
 
-  private async tryDirectCommand(userPhone: string, message: string) {
-    const normalized = message.trim().toLowerCase();
-
-    if (this.isGreeting(normalized)) {
-      const products = await this.productsService.listAvailableProducts();
-      const featuredProducts = products.slice(0, 3).map((product) => product.name);
-      const productHint =
-        featuredProducts.length > 0
-          ? ` We currently have ${featuredProducts.join(', ')}.`
-          : '';
-
-      return {
-        text: `Hello! Welcome to our store.${productHint} What would you like to buy today?`,
-      };
-    }
-
-    if (this.isCartViewRequest(normalized)) {
-      return {
-        text: await this.ordersService.viewCart(userPhone),
-      };
-    }
-
-    if (
-      this.matchesExactPhrase(
-        normalized,
-        this.getConfiguredPhrases(
-          'chat.phrases.cartClear',
-          DEFAULT_CHAT_PHRASES.cartClear,
-        ),
-      )
-    ) {
-      return {
-        text: await this.ordersService.clearCart(userPhone),
-      };
-    }
-
-    if (this.isProductListRequest(normalized)) {
-      return {
-        text: await this.formatAvailableProducts(),
-      };
-    }
-
-    const productInquiryReply = await this.tryProductInquiryCommand(normalized);
-    if (productInquiryReply) {
-      return productInquiryReply;
-    }
-
-    const conditionalAvailabilityReply = await this.tryConditionalAvailabilityCommand(
-      normalized,
-    );
-    if (conditionalAvailabilityReply) {
-      return conditionalAvailabilityReply;
-    }
-
-    const removeReply = await this.tryRemoveFromCartCommand(userPhone, normalized);
-    if (removeReply) {
-      return removeReply;
-    }
-
-    const quantityReply = await this.tryQuantityBasedCartCommand(userPhone, normalized);
-    if (quantityReply) {
-      return quantityReply;
-    }
-
-    const productSelectionReply = await this.tryProductSelectionCommand(
-      userPhone,
-      normalized,
-    );
-    if (productSelectionReply) {
-      return productSelectionReply;
-    }
-
-    if (this.isAffirmativeReply(normalized)) {
-      return this.resolveYesReply(userPhone);
-    }
-
-    if (this.isNegativeReply(normalized)) {
-      return this.resolveNoReply(userPhone);
-    }
-
-    if (this.isMaybeReply(normalized)) {
-      return this.resolveMaybeReply(userPhone);
-    }
-
-    const paymentReply = await this.tryPaymentCommand(userPhone, normalized);
-    if (paymentReply) {
-      return paymentReply;
-    }
-
-    return null;
-  }
-
-  private isGreeting(message: string) {
-    return this.matchesAnyPhrase(
-      message,
-      this.getConfiguredPhrases('chat.phrases.greeting', DEFAULT_CHAT_PHRASES.greeting),
-    );
-  }
-
-  private isAffirmativeReply(message: string) {
-    return this.matchesAnyPhrase(
-      message,
-      this.getConfiguredPhrases(
-        'chat.phrases.affirmative',
-        DEFAULT_CHAT_PHRASES.affirmative,
-      ),
-    );
-  }
-
-  private isNegativeReply(message: string) {
-    return this.matchesAnyPhrase(
-      message,
-      this.getConfiguredPhrases('chat.phrases.negative', DEFAULT_CHAT_PHRASES.negative),
-    );
-  }
-
-  private isMaybeReply(message: string) {
-    return this.matchesAnyPhrase(
-      message,
-      this.getConfiguredPhrases('chat.phrases.maybe', DEFAULT_CHAT_PHRASES.maybe),
-    );
-  }
-
-  private async tryProductSelectionCommand(
-    userPhone: string,
-    message: string,
-  ) {
-    const products = await this.productsService.listAvailableProducts();
-    const matchedProducts = products.filter((product) =>
-      this.messageReferencesProduct(message, product.name),
-    );
-
-    if (!matchedProducts.length) {
-      return null;
-    }
-
-    const soundsLikePurchase = this.matchesAnyPhrase(
-      message,
-      this.getConfiguredPhrases('chat.phrases.purchase', DEFAULT_CHAT_PHRASES.purchase),
-    );
-
-    if (!soundsLikePurchase) {
-      return null;
-    }
-
-    const cartText = await this.ordersService.addItemsToCart(
-      userPhone,
-      matchedProducts.map((product) => ({
-        name: product.name,
-        quantity: 1,
-      })),
-    );
-
-    return {
-      text: `Added to your cart.\n${cartText}`,
-    };
-  }
-
-  private async tryQuantityBasedCartCommand(
-    userPhone: string,
-    message: string,
-  ) {
-    const hasQuantitySignal =
-      /\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b/i.test(message);
-    const soundsLikePurchase = this.matchesAnyPhrase(
-      message,
-      this.getConfiguredPhrases('chat.phrases.purchase', DEFAULT_CHAT_PHRASES.purchase),
-    );
-
-    if (!hasQuantitySignal && !soundsLikePurchase) {
-      return null;
-    }
-
-    const products = await this.productsService.listAvailableProducts();
-    const matchedProducts = this.parseQuantityProductPairs(message, products);
-
-    if (!matchedProducts.length) {
-      return null;
-    }
-
-    const cartText = await this.ordersService.addItemsToCart(
-      userPhone,
-      matchedProducts.map((item) => ({
-        name: item.product.name,
-        quantity: item.quantity,
-      })),
-    );
-
-    return {
-      text: `Added to your cart.\n${cartText}`,
-    };
-  }
-
-  private async tryProductInquiryCommand(message: string) {
-    if (!this.isProductInquiryRequest(message)) {
-      return null;
-    }
-
-    const products = await this.productsService.listAvailableProducts();
-    const matchedProducts = products.filter((product) =>
-      this.messageReferencesProduct(message, product.name),
-    );
-
-    if (matchedProducts.length > 0) {
-      return {
-        text: this.formatProductDetails(matchedProducts, products),
-      };
-    }
-
-    return {
-      text: this.formatUnavailableProductResponse(message, products),
-    };
-  }
-
-  private async tryConditionalAvailabilityCommand(message: string) {
-    if (!this.isConditionalAvailabilityRequest(message)) {
-      return null;
-    }
-
-    const products = await this.productsService.listAvailableProducts();
-    const matchedProducts = products.filter((product) =>
-      this.messageReferencesProduct(message, product.name),
-    );
-
-    if (matchedProducts.length > 0) {
-      return {
-        text: this.formatAvailabilityConfirmationResponse(matchedProducts, products),
-      };
-    }
-
-    return {
-      text: this.formatUnavailableProductResponse(message, products),
-    };
-  }
-
-  private async tryPaymentCommand(userPhone: string, message: string) {
-    const soundsLikePayment = this.matchesAnyPhrase(
-      message,
-      this.getConfiguredPhrases('chat.phrases.payment', DEFAULT_CHAT_PHRASES.payment),
-    );
-
-    if (!soundsLikePayment) {
-      return null;
-    }
-
-    const paymentMessage = await this.ordersService.getPaymentMessage(userPhone);
-    if (!paymentMessage) {
-      return {
-        text: 'There is no active order to pay for yet. Add items to your cart first.',
-      };
-    }
-
-    return {
-      text: paymentMessage,
-      state: {
-        type: 'request_payment',
-      },
-    };
-  }
-
-  private async tryRemoveFromCartCommand(userPhone: string, message: string) {
-    const soundsLikeRemoval = this.matchesAnyPhrase(
-      message,
-      this.getConfiguredPhrases('chat.phrases.removal', DEFAULT_CHAT_PHRASES.removal),
-    );
-
-    if (!soundsLikeRemoval) {
-      return null;
-    }
-
-    const products = await this.productsService.listAvailableProducts();
-    const matchedProducts = this.parseQuantityProductPairs(message, products);
-
-    if (!matchedProducts.length) {
-      return null;
-    }
-
-    const cartText = await this.ordersService.removeItemsFromCart(
-      userPhone,
-      matchedProducts.map((item) => ({
-        name: item.product.name,
-        quantity: item.quantity,
-      })),
-    );
-
-    return {
-      text: `Removed from your cart.\n${cartText}`,
-    };
-  }
-
-  private parseQuantityProductPairs(
-    message: string,
-    products: Array<{ name: string }>,
-  ) {
-    const normalized = message
-      .toLowerCase()
-      .replace(/[.,!?]/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim();
-
-    const numberWords: Record<string, number> = {
-      one: 1,
-      two: 2,
-      three: 3,
-      four: 4,
-      five: 5,
-      six: 6,
-      seven: 7,
-      eight: 8,
-      nine: 9,
-      ten: 10,
-    };
-
-    return products
-      .map((product) => {
-        const aliases = this.productSearchTerms(product.name);
-        for (const alias of aliases) {
-          const regex = new RegExp(
-            `(?:\\b(?<qty>\\d+|one|two|three|four|five|six|seven|eight|nine|ten)\\b\\s+)?(?:\\b(?:and|plus)\\b\\s*)?(?:the\\s+)?\\b${this.escapeRegex(alias)}\\b`,
-            'i',
-          );
-
-          const match = normalized.match(regex);
-          if (!match?.groups) {
-            continue;
-          }
-
-          const rawQty = match.groups.qty?.toLowerCase();
-          const quantity = rawQty ? numberWords[rawQty] ?? Number(rawQty) : 1;
-
-          if (!Number.isFinite(quantity) || quantity <= 0) {
-            continue;
-          }
-
-          return {
-            product,
-            quantity: Math.trunc(quantity),
-          };
-        }
-
-        return null;
-      })
-      .filter(
-        (item): item is { product: { name: string }; quantity: number } =>
-          Boolean(item),
-      );
-  }
-
-  private productSearchTerms(productName: string) {
-    const normalized = productName.toLowerCase();
-    const parts = normalized
-      .split(/\s+/)
-      .map((part) => part.trim())
-      .filter((part) => part.length >= 4);
-
-    const suffix = normalized.split(/\s+/).slice(-1)[0];
-    if (suffix && suffix.length >= 4 && !parts.includes(suffix)) {
-      parts.push(suffix);
-      parts.push(this.pluralizeTerm(suffix));
-    }
-
-    parts.push(this.pluralizeTerm(normalized));
-
-    return Array.from(new Set(parts));
-  }
-
-  private messageReferencesProduct(message: string, productName: string) {
-    const normalizedProductName = productName.toLowerCase();
-
-    if (message.includes(normalizedProductName)) {
-      return true;
-    }
-
-    const aliases = this.productSearchTerms(productName);
-    return aliases.some((alias) => new RegExp(`\\b${this.escapeRegex(alias)}\\b`, 'i').test(message));
-  }
-
-  private isProductListRequest(message: string) {
-    return this.matchesAnyPhrase(
-      message,
-      this.getConfiguredPhrases(
-        'chat.phrases.productList',
-        DEFAULT_CHAT_PHRASES.productList,
-      ),
-    );
-  }
-
-  private isCartViewRequest(message: string) {
-    const configuredPhrases = this.getConfiguredPhrases(
-      'chat.phrases.cartView',
-      DEFAULT_CHAT_PHRASES.cartView,
-    );
-
-    if (this.matchesExactPhrase(message, configuredPhrases)) {
-      return true;
-    }
-
-    return (
-      /\b(?:show|show me|list|display|what(?:'s| is)?|what is)\b.*\b(?:my\s+)?(?:cart|car)\b/i.test(
-        message,
-      ) ||
-      /\bitems?\s+in\s+my\s+(?:cart|car)\b/i.test(message) ||
-      /\b(?:what(?:'s| is)?|show me|show|list|display)\s+.*\b(?:in|inside)\s+my\s+(?:cart|car)\b/i.test(
-        message,
-      )
-    );
-  }
-
-  private matchesAnyPhrase(message: string, phrases: string[]) {
-    return phrases.some((phrase) => this.messageContainsPhrase(message, phrase));
-  }
-
-  private matchesExactPhrase(message: string, phrases: string[]) {
-    const normalizedMessage = message.trim().toLowerCase();
-    return phrases.some((phrase) => phrase.trim().toLowerCase() === normalizedMessage);
-  }
-
-  private getConfiguredPhrases(key: string, fallback: readonly string[]) {
-    const configured = this.configService.get<unknown>(key);
-
-    if (Array.isArray(configured)) {
-      return this.normalizePhraseList(configured);
-    }
-
-    if (typeof configured === 'string') {
-      return this.normalizePhraseList(configured.split(','));
-    }
-
-    if (key === 'chat.phrases.productList') {
-      const legacyConfigured = this.configService.get<unknown>('chat.productListPhrases');
-
-      if (Array.isArray(legacyConfigured)) {
-        return this.normalizePhraseList(legacyConfigured);
-      }
-
-      if (typeof legacyConfigured === 'string') {
-        return this.normalizePhraseList(legacyConfigured.split(','));
-      }
-    }
-
-    return Array.from(fallback);
-  }
-
-  private normalizePhraseList(phrases: unknown[]) {
-    return phrases
-      .map((phrase) => String(phrase).trim().toLowerCase())
-      .filter((phrase) => phrase.length > 0);
-  }
-
-  private messageContainsPhrase(message: string, phrase: string) {
-    const normalizedPhrase = phrase.trim().toLowerCase();
-    if (!normalizedPhrase) {
-      return false;
-    }
-
-    const pattern = new RegExp(
-      `(?:^|\\b)${this.escapeRegex(normalizedPhrase)}(?:\\b|$)`,
-      'i',
-    );
-
-    return pattern.test(message);
-  }
-
-  private isProductInquiryRequest(message: string) {
-    return (
-      /\b(do you have|have you got|is there|are there|available|tell me about|what is|what's|price of|cost of|details on)\b/i.test(
-        message,
-      ) ||
-      /\b(is|are)\s+.*\s+available\b/i.test(message)
-    );
-  }
-
-  private isConditionalAvailabilityRequest(message: string) {
-    return (
-      /\bif you have\b/i.test(message) ||
-      /\bif available\b/i.test(message) ||
-      /\bif (?:it|that|they|there)\s+(?:is|are|was|were)\s+available\b/i.test(message)
-    );
-  }
-
-  private async formatAvailableProducts() {
-    const products = await this.productsService.listAvailableProducts();
-    if (!products.length) {
-      return 'No products are available right now.';
-    }
-
-    return [
-      'We have the following products in stock:',
-      ...products.map(
-        (product) =>
-          `${product.name} - $${Number(product.price).toFixed(2)}${product.description ? ` - ${product.description}` : ''}`,
-      ),
-    ].join('\n');
-  }
-
-  private formatProductDetails(
-    products: Array<{
-      name: string;
-      price: unknown;
-      description?: string | null;
-    }>,
-    catalog: Array<{
-      name: string;
-      price: unknown;
-      description?: string | null;
-    }> = products,
-  ) {
-    const lines = products.map((product) => {
-      const description = product.description?.trim();
-      return [
-        `${product.name} - $${Number(product.price).toFixed(2)}`,
-        description ? `Description: ${description}` : 'Description: Not available',
-      ].join('\n');
+  private async sendReply(userPhone: string, userMsg: string, reply: AssistantReply) {
+    this.logger.log(`Sending reply to ${userPhone}: "${reply.text}"`);
+
+    // 1. Save History
+    await this.prisma.chatHistory.createMany({
+      data: [
+        { userPhone, message: userMsg, role: 'user' },
+        { userPhone, message: reply.text, role: 'assistant' }
+      ]
     });
 
-    const bestMatch = this.pickBestInquiryMatch(products, catalog);
-    const suggestion = bestMatch
-      ? `Best match: ${bestMatch.name} if you want the most relevant option first.`
-      : null;
-
-    return [
-      products.length > 1 ? 'Here are the matching products:' : 'Here is what I found:',
-      ...lines,
-      suggestion ?? '',
-      '',
-      'Would you like me to add it to your cart?',
-    ].join('\n');
-  }
-
-  private formatUnavailableProductResponse(
-    message: string,
-    catalog: Array<{
-      name: string;
-      price: unknown;
-      description?: string | null;
-    }>,
-  ) {
-    const requestedProduct = this.extractRequestedProductName(message);
-    const availableProducts = catalog.slice(0, 3);
-
-    const availableNames = availableProducts.map((product) => product.name);
-    const suggestedNames =
-      availableNames.length > 0
-        ? availableNames.length === 1
-          ? availableNames[0]
-          : availableNames.length === 2
-            ? `${availableNames[0]} and ${availableNames[1]}`
-            : `${availableNames.slice(0, -1).join(', ')}, and ${availableNames[availableNames.length - 1]}`
-        : null;
-
-    const productLine =
-      requestedProduct && requestedProduct !== 'that'
-        ? suggestedNames
-          ? `Sorry, we do not have ${requestedProduct} right now, but we do have ${suggestedNames}.`
-          : `Sorry, we do not have ${requestedProduct} right now.`
-        : suggestedNames
-          ? `Sorry, that item is not in stock right now, but we do have ${suggestedNames}.`
-          : 'Sorry, that item is not in stock right now.';
-
-    if (!availableProducts.length) {
-      return `${productLine} We do not have any other products available at the moment.`;
-    }
-
-    return productLine;
-  }
-
-  private formatAvailabilityConfirmationResponse(
-    products: Array<{
-      name: string;
-      price: unknown;
-      description?: string | null;
-    }>,
-    catalog: Array<{
-      name: string;
-      price: unknown;
-      description?: string | null;
-    }>,
-  ) {
-    void catalog;
-
-    return products.length > 1
-      ? `Yes, we have ${products.map((product) => product.name).join(', ')}. Want me to add them to your cart?`
-      : `Yes, we have ${products[0].name}. Want me to add them to your cart?`;
-  }
-
-  private pickBestInquiryMatch(
-    matches: Array<{ name: string }>,
-    catalog: Array<{ name: string; description?: string | null }>,
-  ) {
-    if (matches.length === 0) {
-      return null;
-    }
-
-    const lowerCatalog = catalog.map((item) => ({
-      ...item,
-      searchable: `${item.name} ${item.description ?? ''}`.toLowerCase(),
-    }));
-
-    return (
-      matches.find((match) => {
-        const query = match.name.toLowerCase();
-        return lowerCatalog.some((item) => item.searchable.includes(query));
-      }) ?? matches[0]
-    );
-  }
-
-  private async resolveYesReply(userPhone: string): Promise<AssistantReply> {
-    const state = await this.getUserSessionState(userPhone);
-
-    if (!state) {
-      return {
-        text: 'Sure. What would you like to buy or confirm?',
-      };
-    }
-
-    if (state.type === 'confirm_order') {
-      const products = this.parseProductsFromPayload(state.payload?.products);
-      if (!products.length) {
-        return {
-          text: 'I need the items again before I can confirm that order.',
-        };
-      }
-
-      const order = await this.ordersService.createOrderMulti(userPhone, products);
-      const paymentMessage = await this.ordersService.getPaymentMessage(userPhone);
-
-      return {
-        text:
-          paymentMessage ??
-          `Order created. Total: $${Number(order.total).toFixed(2)}. Please try again if payment does not appear.`,
-        state: {
-          type: 'request_payment',
-        },
-      };
-    }
-
-    if (state.type === 'request_payment') {
-      const paymentMessage = await this.ordersService.getPaymentMessage(userPhone);
-      return {
-        text: paymentMessage ?? 'There is no active order waiting for payment.',
-        state: {
-          type: 'request_payment',
-        },
-      };
-    }
-
-    return {
-      text: 'Sure. What would you like to buy or confirm?',
-    };
-  }
-
-  private async resolveNoReply(userPhone: string): Promise<AssistantReply> {
-    const state = await this.getUserSessionState(userPhone);
-
-    if (!state) {
-      return {
-        text: 'No problem. What would you like to do next?',
-      };
-    }
-
-    if (state.type === 'confirm_order') {
-      const cancelled = await this.ordersService.cancelPending(userPhone);
-      return {
-        text: cancelled
-          ? 'Your active order has been cancelled.'
-          : 'There is no active order to cancel.',
-      };
-    }
-
-    if (state.type === 'request_payment') {
-      return {
-        text: 'No problem. Your order is still saved if you want to pay later.',
-      };
-    }
-
-    return {
-      text: 'No problem. What would you like to do next?',
-    };
-  }
-
-  private async resolveMaybeReply(userPhone: string): Promise<AssistantReply> {
-    const state = await this.getUserSessionState(userPhone);
-
-    if (!state) {
-      return {
-        text: 'No worries. What would you like to buy or ask about?',
-      };
-    }
-
-    if (state.type === 'confirm_order') {
-      return {
-        text: 'No worries. I will keep the items in your cart for now.',
-      };
-    }
-
-    if (state.type === 'request_payment') {
-      return {
-        text: 'No problem. Your order remains saved if you want to pay later.',
-      };
-    }
-
-    return {
-      text: 'No worries. What would you like to buy or ask about?',
-    };
-  }
-
-  private parseProductsFromPayload(payload: unknown) {
-    if (!Array.isArray(payload)) {
-      return [];
-    }
-
-    return payload
-      .filter((item): item is { name: string; quantity: number } => {
-        return (
-          !!item &&
-          typeof item === 'object' &&
-          typeof (item as { name?: unknown }).name === 'string' &&
-          typeof (item as { quantity?: unknown }).quantity === 'number'
-        );
-      })
-      .map((item) => ({
-        name: item.name,
-        quantity: item.quantity,
-      }));
-  }
-
-  private async getUserSessionState(userPhone: string): Promise<SessionState> {
-    const session = await this.prisma.userSession.findUnique({
-      where: { userPhone },
-    });
-
-    if (!session?.activeState) {
-      return null;
-    }
-
-    return {
-      type: session.activeState as AssistantReplyState,
-      payload: (session.statePayload as Record<string, unknown> | null) ?? {},
-    };
-  }
-
-  private async updateUserSession(
-    userPhone: string,
-    state: AssistantReply['state'] | null,
-  ) {
-    const statePayload = state?.payload
-      ? (state.payload as Prisma.InputJsonValue)
-      : Prisma.DbNull;
-
+    // 2. Update Session
     await this.prisma.userSession.upsert({
       where: { userPhone },
-      create: {
-        userPhone,
-        activeState: state?.type ?? null,
-        statePayload,
-      },
-      update: {
-        activeState: state?.type ?? null,
-        statePayload,
-      },
+      create: { userPhone, activeState: reply.state?.type ?? null, statePayload: (reply.state?.payload as any) ?? {} },
+      update: { activeState: reply.state?.type ?? null, statePayload: (reply.state?.payload as any) ?? {} }
     });
+
+    // 3. Send via WhatsApp
+    if (reply.interactive?.type === 'button') {
+      this.logger.log(`Sending interactive button message to ${userPhone}`);
+      await this.whatsappService.sendInteractiveButtons(
+        userPhone,
+        reply.interactive.data.body,
+        reply.interactive.data.buttons
+      );
+    } else if (reply.interactive?.type === 'list') {
+      this.logger.log(`Sending interactive list message to ${userPhone}`);
+      await this.whatsappService.sendInteractiveList(
+        userPhone,
+        reply.text,
+        reply.interactive.data.button,
+        reply.interactive.data.sections
+      );
+    } else if (reply.interactive?.type === 'flow') {
+      this.logger.log(`Sending flow message to ${userPhone}`);
+      await this.whatsappService.sendFlow(
+        userPhone,
+        reply.text,
+        reply.interactive.data.buttonText,
+        reply.interactive.data.flowId,
+        reply.interactive.data.flowToken,
+        reply.interactive.data.flowAction ?? 'navigate',
+        reply.interactive.data.screenId ?? 'DETAILS',
+        reply.interactive.data.data ?? {}
+      );
+    } else if (reply.text.includes('Browse our digital shop') && this.configService.get<string>('whatsapp.catalogId')) {
+      this.logger.log(`Sending product catalog message to ${userPhone}`);
+      const products = await this.productsService.listAvailableProducts();
+      const categories = [...new Set(products.map(p => p.category || 'General'))];
+      const sections = categories.slice(0, 10).map(cat => ({
+        title: cat,
+        product_retailer_ids: products
+          .filter(p => (p.category || 'General') === cat)
+          .slice(0, 30)
+          .map(p => p.id)
+      }));
+
+      await this.whatsappService.sendMultiProductMessage(
+        userPhone,
+        reply.text,
+        this.configService.get<string>('whatsapp.catalogId')!,
+        sections
+      );
+    } else {
+      this.logger.log(`Sending plain text message to ${userPhone}`);
+      await this.whatsappService.sendMessage(userPhone, reply.text);
+    }
+
+    // 4. Send Product Images if mentioned and available
+    if (reply.text.includes('selected') || reply.text.includes('found')) {
+      const products = await this.productsService.listAvailableProducts();
+      for (const p of products) {
+        if (reply.text.toLowerCase().includes(p.name.toLowerCase()) && p.imageUrl) {
+          await this.whatsappService.sendImage(userPhone, p.imageUrl, p.name);
+        }
+      }
+    }
   }
 
-  private escapeRegex(text: string) {
-    return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  private notifyAdmin(userPhone: string, message: string) {
+    const adminPhone = this.configService.get<string>('app.adminPhone');
+    this.logger.log(`ADMIN ALERT [${userPhone}]: ${message}`);
+    if (adminPhone) {
+      this.whatsappService.sendMessage(adminPhone, `🚨 *Admin Alert* from ${userPhone}\n${message}`).catch(() => { });
+    }
   }
 
-  private extractRequestedProductName(message: string) {
-    const normalized = message
-      .toLowerCase()
-      .replace(/[.,!?]/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim();
+  async handleFlowResponse(userPhone: string, data: any) {
+    this.logger.log(`Received flow response from ${userPhone}: ${JSON.stringify(data)}`);
 
-    const requestPatterns = [
-      /\bif you have\s+(?<item>.+?)(?:\s+(?:add|put|buy|order|to cart|in cart|cart)|$)/i,
-      /\bif available\s+(?<item>.+?)(?:\s+(?:add|put|buy|order|to cart|in cart|cart)|$)/i,
-      /\b(?:do you have|have you got|is there|are there|available|tell me about|what is|what's|price of|cost of|details on)\s+(?<item>.+?)(?:\s+in stock|\s+available|\?|$)/i,
-      /\b(?:is|are)\s+(?<item>.+?)\s+available\b/i,
-    ];
+    // Handle Multi-Screen Flow Payload (cart_json string)
+    if (data.cart) {
+      const products = await this.productsService.listAvailableProducts();
+      const itemsToAdd: { name: string; quantity: number }[] = [];
+      let cartArray = [];
+      try {
+        cartArray = JSON.parse(data.cart);
+      } catch (e) {
+        this.logger.error('Failed to parse cart json from flow', e);
+      }
 
-    for (const pattern of requestPatterns) {
-      const match = normalized.match(pattern);
-      const item = match?.groups?.item?.trim();
-      if (item) {
-        return item;
+      for (const item of cartArray) {
+        const product = products.find(p => p.id === item.id);
+        if (product && item.qty > 0) {
+          itemsToAdd.push({ name: product.name, quantity: item.qty });
+        }
+      }
+
+      if (itemsToAdd.length > 0) {
+        await this.ordersService.addItemsToCart(userPhone, itemsToAdd);
+
+        if (data.fulfillment) {
+          let addressMsg = `Fulfillment: ${data.fulfillment === 'delivery' ? '🚚 Delivery' : '🏪 Pickup'}`;
+          if (data.address) {
+            addressMsg += `\n📍 Address/Landmark: ${data.address}`;
+            await this.ordersService.saveShippingAddress(userPhone, data.address);
+          }
+          
+          const checkoutSummary = await this.ordersService.getPaymentMessage(userPhone);
+          await this.sendReply(userPhone, `[Flow: Order Confirmed]`, {
+            text: `✅ *Order Placed!*\n${addressMsg}\n\n${checkoutSummary}`
+          });
+        } else {
+          const cartSummary = await this.ordersService.viewCart(userPhone);
+          await this.sendReply(userPhone, `[Flow: Added ${itemsToAdd.length} items]`, {
+            text: `🛒 *Your Cart Summary*\n\n${cartSummary}`,
+            interactive: {
+              type: 'button',
+              data: {
+                body: "Would you like to add more or proceed to checkout?",
+                buttons: [
+                  { id: 'shop', title: '➕ Add More' },
+                  { id: 'checkout', title: '💳 Checkout' }
+                ]
+              }
+            }
+          });
+        }
+      } else {
+        await this.sendReply(userPhone, '[Flow: no items selected]', {
+          text: "You didn't select any items. Tap below to try again!",
+          interactive: {
+            type: 'button',
+            data: {
+              body: "No items were selected.",
+              buttons: [{ id: 'shop', title: '🛒 Open Shop' }]
+            }
+          }
+        });
+      }
+      return;
+    }
+
+    // Handle Product Order Flow (flat p0_id/p0_qty … p9_id/p9_qty format)
+    const hasFlatSlots = Object.keys(data).some(k => /^p\d_id$/.test(k));
+    if (hasFlatSlots) {
+      const products = await this.productsService.listAvailableProducts();
+      const itemsToAdd: { name: string; quantity: number }[] = [];
+      const addedNames: string[] = [];
+
+      for (let i = 0; i < 10; i++) {
+        const productId = data[`p${i}_id`];
+        const qty = parseInt(data[`p${i}_qty`] ?? '0', 10);
+        if (!productId || productId === 'empty' || qty <= 0) continue;
+
+        const product = products.find(p => p.id === productId);
+        if (product) {
+          itemsToAdd.push({ name: product.name, quantity: qty });
+          addedNames.push(`${product.name} (x${qty})`);
+        }
+      }
+
+      if (itemsToAdd.length > 0) {
+        await this.ordersService.addItemsToCart(userPhone, itemsToAdd);
+        const cartSummary = await this.ordersService.viewCart(userPhone);
+        await this.sendReply(userPhone, `[Flow: Added ${itemsToAdd.length} items]`, {
+          text: `🛒 *Your Cart Summary*\n\n${cartSummary}`,
+          interactive: {
+            type: 'button',
+            data: {
+              body: "Would you like to add more or proceed to checkout?",
+              buttons: [
+                { id: 'shop', title: '➕ Add More' },
+                { id: 'checkout', title: '💳 Checkout' }
+              ]
+            }
+          }
+        });
+      } else {
+        await this.sendReply(userPhone, '[Flow: no items selected]', {
+          text: "You didn't select any items. Tap below to try again!",
+          interactive: {
+            type: 'button',
+            data: {
+              body: "No items were selected.",
+              buttons: [{ id: 'shop', title: '🛒 Open Shop' }]
+            }
+          }
+        });
+      }
+      return;
+    }
+
+    // Handle Customer Info Flow (existing)
+    if (data.full_name && data.shipping_address) {
+      await this.ordersService.saveCustomerFlowData(userPhone, {
+        full_name: data.full_name,
+        shipping_address: data.shipping_address
+      });
+
+      const paymentMsg = await this.ordersService.getPaymentMessage(userPhone);
+      if (paymentMsg) {
+        await this.sendReply(userPhone, "[Flow Submitted]", {
+          text: `Perfect! We have everything we need.\n\n${paymentMsg}`,
+          state: { type: 'request_payment' }
+        });
+        this.notifyAdmin(userPhone, "New order ready for payment (via Flow)");
+      }
+    }
+  }
+
+  async handleCatalogOrder(userPhone: string, orderData: any) {
+    this.logger.log(`Processing catalog order for ${userPhone}`);
+
+    const products = await this.productsService.listAvailableProducts();
+    const itemsToAdd: { name: string; quantity: number }[] = [];
+    const addedNames: string[] = [];
+
+    for (const item of orderData.product_items) {
+      const product = products.find(p => p.id === item.product_retailer_id);
+      if (product) {
+        const quantity = parseInt(item.quantity, 10);
+        itemsToAdd.push({ name: product.name, quantity });
+        addedNames.push(`${product.name} (x${quantity})`);
       }
     }
 
-    return null;
-  }
+    if (itemsToAdd.length > 0) {
+      // Use true to replace the existing cart with the catalog's selection
+      await this.ordersService.createOrderMulti(userPhone, itemsToAdd);
+      const cartSummary = await this.ordersService.viewCart(userPhone);
 
-  private pluralizeTerm(term: string) {
-    if (term.endsWith('s')) {
-      return term;
+      await this.sendReply(userPhone, `[Catalog Order: ${itemsToAdd.length} items]`, {
+        text: `🛒 *Cart Updated from Catalog!*\n\nItems added:\n• ${addedNames.join('\n• ')}\n\n${cartSummary}`,
+        interactive: {
+          type: 'button',
+          data: {
+            body: "Would you like to add more or proceed to checkout?",
+            buttons: [
+              { id: 'catalog', title: '🔄 Re-open Shop' },
+              { id: 'checkout', title: '💳 Checkout Now' }
+            ]
+          }
+        }
+      });
     }
-
-    if (/(ch|sh|x|z)$/.test(term)) {
-      return `${term}es`;
-    }
-
-    if (/[^aeiou]y$/.test(term)) {
-      return `${term.slice(0, -1)}ies`;
-    }
-
-    return `${term}s`;
   }
 }

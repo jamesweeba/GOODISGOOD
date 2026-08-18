@@ -113,6 +113,8 @@ Shorter values make the bot reply faster. Longer values keep the typing indicato
 - `GET /webhook` verifies the Meta webhook subscription.
 - `POST /webhook` receives inbound WhatsApp messages.
 
+For webhook signature verification, set `WHATSAPP_APP_SECRET` to your Meta app secret. The app uses the raw request body plus `X-Hub-Signature-256` to validate inbound webhook calls.
+
 ## Admin Dashboard
 
 Open `GET /admin` in the browser to view the dashboard. If `ADMIN_TOKEN` is set, pass it as a query parameter:

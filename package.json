@@ -17,7 +17,9 @@
     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\" \"prisma/**/*.ts\"",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
-    "prisma:seed": "ts-node --project tsconfig.json prisma/seed.ts"
+    "prisma:seed": "ts-node --project tsconfig.json prisma/seed.ts",
+    "flow:find-waba": "node scripts/find-waba.js",
+    "flow:deploy": "node scripts/deploy-flow.js"
   },
   "dependencies": {
     "@nestjs/common": "^10.4.12",
@@ -28,8 +30,10 @@
     "axios": "^1.8.4",
     "class-transformer": "^0.5.1",
     "class-validator": "^0.14.1",
+    "nest-winston": "^1.10.2",
     "reflect-metadata": "^0.2.2",
-    "rxjs": "^7.8.1"
+    "rxjs": "^7.8.1",
+    "winston": "^3.19.0"
   },
   "devDependencies": {
     "@nestjs/cli": "^10.4.9",
